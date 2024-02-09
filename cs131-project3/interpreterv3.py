@@ -1,496 +1,356 @@
-
-import copy
-from enum import Enum
-
 from brewparse import parse_program
-from env_v2 import EnvironmentManager
-from intbase import InterpreterBase, ErrorType
-from type_valuev2 import Type, Value, create_value, get_printable
-
-class LambdaClosure:
-    def __init__(self, lambda_ast, captured_env):
-        self.lambda_ast = lambda_ast
-        self.captured_env = captured_env
-
-
-class ExecStatus(Enum):
-    CONTINUE = 1
-    RETURN = 2
-
-
-# Main interpreter class
+from intbase import InterpreterBase
+from intbase import ErrorType
+import copy
+class ReturnException(Exception):
+    def __init__(self, value=None):
+        self.value = "nil" if value is None else value
 class Interpreter(InterpreterBase):
-    # constants
-    NIL_VALUE = create_value(InterpreterBase.NIL_DEF)
-    TRUE_VALUE = create_value(InterpreterBase.TRUE_DEF)
-    BIN_OPS = {"+", "-", "*", "/", "==", "!=", ">", ">=", "<", "<=", "||", "&&"}
-
-    # methods
     def __init__(self, console_output=True, inp=None, trace_output=False):
         super().__init__(console_output, inp)
         self.trace_output = trace_output
-        self.__setup_ops()
+        self.variables = {}
+        self.functions = {} 
+        self.variables_stack = [{}]
 
-    # run a program that's provided in a string
-    # usese the provided Parser found in brewparse.py to parse the program
-    # into an abstract syntax tree (ast)
     def run(self, program):
         ast = parse_program(program)
-        self.__set_up_function_table(ast)
-        self.env = EnvironmentManager()
-        main_func = self.__get_func_by_name("main", 0)
-        self.__run_statements(main_func.get("statements"))
-    
-    def __set_up_function_table(self, ast):
-        self.func_name_to_ast = {}
-        for func_def in ast.get("functions"):
-            func_name = func_def.get("name")
-            num_params = len(func_def.get("args"))
-            if func_name not in self.func_name_to_ast:
-                self.func_name_to_ast[func_name] = {}
-            self.func_name_to_ast[func_name][num_params] = func_def
+        if ast.elem_type == 'program':
+            # Store all functions with their parameter count
+            for func in ast.dict['functions']:
+                func_name = func.dict['name']
+                param_count = len(func.dict.get('args', []))
+                self.functions[(func_name, param_count)] = func
 
-    def __get_func_by_name(self, name, num_params):
-        if name not in self.func_name_to_ast:
-            super().error(ErrorType.NAME_ERROR, f"Function {name} not found")
-        candidate_funcs = self.func_name_to_ast[name]
-        if num_params not in candidate_funcs:
-            super().error(
-                ErrorType.NAME_ERROR,
-                f"Function {name} taking {num_params} params not found",
-            )
-        return candidate_funcs[num_params]
-
-    def __run_statements(self, statements):
-        self.env.push()
-        for statement in statements:
-            if self.trace_output:
-                print(statement)
-            status = ExecStatus.CONTINUE
-            if statement.elem_type == InterpreterBase.FCALL_DEF:
-                self.__call_func(statement)
-            elif statement.elem_type == "=":
-                self.__assign(statement)
-            elif statement.elem_type == InterpreterBase.RETURN_DEF:
-                status, return_val = self.__do_return(statement)
-            elif statement.elem_type == Interpreter.IF_DEF:
-                status, return_val = self.__do_if(statement)
-            elif statement.elem_type == Interpreter.WHILE_DEF:
-                status, return_val = self.__do_while(statement)
-
-            if status == ExecStatus.RETURN:
-                self.env.pop()
-                return (status, return_val)
-
-        self.env.pop()
-        return (ExecStatus.CONTINUE, Interpreter.NIL_VALUE)
-    
-    def __call_lambda(self, lambda_closure, actual_args):
-        saved_env = self.env
-
-        # Set the environment to the lambda's captured environment
-        self.env = lambda_closure.captured_env
-        self.env.push()
-
-        # Bind actual arguments to lambda's parameters
-        formal_args = lambda_closure.lambda_ast.get("args")
-        if len(actual_args) != len(formal_args):
-            super().error(ErrorType.TYPE_ERROR, "Incorrect number of arguments for lambda function")
-
-        # Store references for reference arguments
-        ref_args = {}
-        for formal_ast, actual_ast in zip(formal_args, actual_args):
-            if formal_ast.elem_type == "refarg":
-                # Handle reference arguments
-                if actual_ast.elem_type != "var":
-                    super().error(ErrorType.TYPE_ERROR, "Reference argument must be a variable for pass by reference")
-                arg_name = formal_ast.get("name")
-                actual_var_name = actual_ast.get("name")
-                # Store the reference
-                var_ref = saved_env.get_reference(actual_var_name)
-                if var_ref:
-                    ref_args[arg_name] = var_ref
-                    self.env.create(arg_name, saved_env.get(actual_var_name))
-                else:
-                    super().error(ErrorType.NAME_ERROR, f"Variable {actual_var_name} not found for pass by reference")
+            # Check for main function and run
+            main_function = self.functions.get(("main", 0), None)
+            if main_function:
+                self.run_function_node(main_function)
             else:
-                # Evaluate and bind non-reference arguments
-                result = self.__eval_expr(actual_ast)
-                arg_name = formal_ast.get("name")
-                self.env.create(arg_name, result)
+                super().error(ErrorType.NAME_ERROR, "No main() function was found")
+                
+    def run_function_node(self, func_node):
+        self.variables_stack.append({})
+        try:
+            if func_node.elem_type == 'func':
+                for stmt in func_node.dict['statements']:
+                    self.run_statement(stmt)
+        except ReturnException as e:
+            return e.value
+        finally:
+        # Remove the function's scope after execution
+            self.variables_stack.pop()
+        return "nil" 
 
-        # Execute the lambda's body
-        status, return_val = self.__run_statements(lambda_closure.lambda_ast.get("statements"))
+    def run_statement(self, stmt_node):
+        if stmt_node.elem_type == '=':
+            self.handle_assignment(stmt_node.dict['name'], stmt_node.dict['expression'])
+        elif stmt_node.elem_type == 'fcall':
+            self.handle_function_call(stmt_node)
+        elif stmt_node.elem_type == 'if':
+            self.handle_if_statement(stmt_node.dict['condition'], stmt_node.dict['statements'], stmt_node.dict.get('else_statements'))
+        elif stmt_node.elem_type == 'while':
+            self.handle_while_statement(stmt_node.dict['condition'], stmt_node.dict['statements'])
+        elif stmt_node.elem_type == 'return':
+            self.handle_return_statement(stmt_node.dict.get('expression'))
 
-        # Update the original variables for reference arguments
-        for ref_name, ref_actual in ref_args.items():
-            if ref_actual["type"] == "ref":
-                ref_actual["env"][ref_actual["key"]] = self.env.get(ref_name)
+    def handle_assignment(self, var_name, expression_node):
+        value = self.evaluate_expression(expression_node)
+        # Dynamic scoping: Assign to the most immediate scope that has the variable
+        scope = self.find_variable_scope(var_name)
+        if scope is not None:
+            scope[var_name] = value
+        else:
+            # If not found in any scope, assign it to the current (top) scope
+            self.current_scope()[var_name] = value
 
-        # Restore the original environment
-        self.env.pop()
-        self.env = saved_env
+        if self.trace_output:
+            print(f"{var_name} = {value}")
 
-        return return_val
+    def current_scope(self):
+        # Returns the current scope (top of the stack)
+        return self.variables_stack[-1]
     
-    def __call_func(self, call_node):
+    def find_variable_scope(self, var_name):
+        # Search for the variable's scope in the stack from top (most recent scope) to bottom (global scope)
+        for scope in reversed(self.variables_stack):
+            if var_name in scope:
+                return scope
+        return None
+    
+    def handle_if_statement(self, condition_node, true_statements, else_statements=None):
+        condition_value = self.evaluate_expression(condition_node)
 
-        func_identifier = call_node.get("name")
-        actual_args = call_node.get("args")
-
-        # Check if the identifier is a function reference from a variable or a direct function name
-        func_or_closure = self.env.get(func_identifier)
-        if isinstance(func_or_closure, dict) and func_or_closure.get("type") == "function_ref":
-            # Retrieve the actual function name
-            func_name = func_or_closure.get("name")
-        elif func_identifier in self.func_name_to_ast and len(self.func_name_to_ast[func_identifier]) > 1:
-            # Error if the function name is overloaded
-            super().error(ErrorType.NAME_ERROR, f"Ambiguous function reference to overloaded function '{func_identifier}'")
+        if type(condition_value) != bool:
+            self.error(ErrorType.TYPE_ERROR, "Condition in 'if' statement must evaluate to a boolean value.")
             return
-        else:
-            func_name = func_identifier
-
-        # Handle built-in functions like 'print' and 'input'
-        if func_name == "print":
-            return self.__call_print(call_node)
-        if func_name == "inputi":
-            return self.__call_input(call_node)
-        if func_name == "inputs":
-            return self.__call_input(call_node)
-
-        # Call the function or lambda
-        if isinstance(func_or_closure, LambdaClosure):
-            if len(actual_args) != len(func_or_closure.lambda_ast.get("args")):
-                super().error(ErrorType.TYPE_ERROR, "Incorrect number of arguments for lambda function")
-            return self.__call_lambda(func_or_closure, actual_args)
-
-        # Retrieve the function definition and call it
-        func_def = self.func_name_to_ast.get(func_name, {}).get(len(actual_args))
-        if not func_def:
-            super().error(ErrorType.TYPE_ERROR, f"Incorrect number of arguments for function {func_name}")
-        ref_lambdas = {}  # Store original lambda closures for reference arguments
-
-
-        self.env.push()
-        ref_args = {}  # Store references for reference arguments
-
-        for formal_ast, actual_ast in zip(func_def.get("args"), actual_args):
-            if formal_ast.elem_type == "refarg":
-                # Handle reference arguments
-                if actual_ast.elem_type == "var":
-                    # For variable references, store the variable reference
-                    arg_name = actual_ast.get("name")
-                    ref_args[formal_ast.get("name")] = self.env.get_reference(arg_name)
-                    self.env.create(formal_ast.get("name"), self.env.get(arg_name))
-                elif actual_ast.elem_type == "lambda":
-                    # For lambda references, directly use the lambda closure
-                    lambda_closure = self.__eval_expr(actual_ast)
-                    ref_args[formal_ast.get("name")] = lambda_closure
-                    self.env.create(formal_ast.get("name"), lambda_closure)
-            else:
-                # Handle non-reference arguments with a deep copy for lambdas
-                evaluated_arg = self.__eval_expr(actual_ast)
-                if isinstance(evaluated_arg, LambdaClosure):
-                    evaluated_arg = LambdaClosure(evaluated_arg.lambda_ast, copy.deepcopy(evaluated_arg.captured_env))
-                self.env.create(formal_ast.get("name"), evaluated_arg)
-
-        # Execute the function body
-        status, return_val = self.__run_statements(func_def.get("statements"))
-
-        # Update the original variables or lambda closures for reference arguments
-        for ref_name, ref_actual in ref_args.items():
-            if isinstance(ref_actual, dict) and ref_actual.get("type") == "ref":
-                # Update variable references
-                ref_actual["env"][ref_actual["key"]] = self.env.get(ref_name)
-            elif isinstance(ref_actual, LambdaClosure):
-                # Update lambda closures
-                modified_lambda = self.env.get(ref_name)
-                if modified_lambda != ref_actual:
-                    ref_actual.captured_env = modified_lambda.captured_env
-
-        self.env.pop()
-        return return_val
-    def __call_print(self, call_ast):
-        output = ""
-        for arg in call_ast.get("args"):
-            result = self.__eval_expr(arg)  # result is a Value object
-            output = output + get_printable(result)
-        super().output(output)
-        return Interpreter.NIL_VALUE
-
-    def __call_input(self, call_ast):
-        args = call_ast.get("args")
-        if args is not None and len(args) == 1:
-            result = self.__eval_expr(args[0])
-            super().output(get_printable(result))
-        elif args is not None and len(args) > 1:
-            super().error(
-                ErrorType.NAME_ERROR, "No inputi() function that takes > 1 parameter"
-            )
-        inp = super().get_input()
-        if call_ast.get("name") == "inputi":
-            return Value(Type.INT, int(inp))
-        if call_ast.get("name") == "inputs":
-            return Value(Type.STRING, inp)
-
-    def __assign(self, assign_ast):
-        var_name = assign_ast.get("name")
-        value = self.__eval_expr(assign_ast.get("expression"))
-
-        if isinstance(value, dict) and value.get("type") == "function_ref":
-            # Check if the function has overloaded versions
-            func_name = value.get("name")
-            if len(self.func_name_to_ast.get(func_name, {})) > 1:
-                super().error(ErrorType.NAME_ERROR, f"Ambiguous function reference: {func_name} has overloaded versions")
-            else:
-                # Store the function reference as a special value
-                self.env.set(var_name, value)
-        elif isinstance(value, LambdaClosure):
-            self.env.set(var_name, value)
-        else:
-            # Check if var_name is a reference, if so, update the referenced variable
-            var_ref = self.env.get_reference(var_name)
-            if var_ref and var_ref.get("type") == "ref":
-                var_ref["env"][var_ref["key"]] = value
-            else:
-                self.env.set(var_name, value)
-
-    def __create_lambda(self, lambda_ast):
-        # Capture the current environment's state
-        captured_env = copy.deepcopy(self.env)
-        # Create a new LambdaClosure object with the lambda_ast and the captured environment
-        return LambdaClosure(lambda_ast, captured_env)
-    def __eval_expr(self, expr_ast):
-        # print("here expr")
-        # print("type: " + str(expr_ast.elem_type))
+        self.variables_stack.append({})
+        try:
+            if condition_value:
+                for stmt in true_statements:
+                    self.run_statement(stmt)
+            elif else_statements:  # This condition ensures that even if else_statements is an empty list, it won't be executed
+                for stmt in else_statements:
+                    self.run_statement(stmt)
+        finally:
+            self.variables_stack.pop()
         
-        if expr_ast.elem_type == InterpreterBase.NIL_DEF:
-            # print("getting as nil")
-            return Interpreter.NIL_VALUE
-        if expr_ast.elem_type == InterpreterBase.INT_DEF:
-            return Value(Type.INT, expr_ast.get("val"))
-        if expr_ast.elem_type == InterpreterBase.STRING_DEF:
-            # print("getting as str")
-            return Value(Type.STRING, expr_ast.get("val"))
-        if expr_ast.elem_type == InterpreterBase.BOOL_DEF:
-            return Value(Type.BOOL, expr_ast.get("val"))
-        if expr_ast.elem_type == InterpreterBase.VAR_DEF:
-            var_name = expr_ast.get("name")
-            var_info = self.env.get(var_name)
-            if var_name in self.func_name_to_ast:
-                # Treat function name as a reference to the function
-                return {"type": "function_ref", "name": var_name}
-            else:
-                val = self.env.get(var_name)
-                if val is None:
-                    super().error(ErrorType.NAME_ERROR, f"Variable {var_name} not found")
-                return val
-        if expr_ast.elem_type == InterpreterBase.FCALL_DEF:
-            return self.__call_func(expr_ast)
-        if expr_ast.elem_type == InterpreterBase.LAMBDA_DEF:
-            return self.__create_lambda(expr_ast)
-        if expr_ast.elem_type in Interpreter.BIN_OPS:
-            return self.__eval_op(expr_ast)
-        if expr_ast.elem_type == Interpreter.NEG_DEF:
-            return self.__eval_unary(expr_ast, Type.INT, lambda x: -1 * x)
-        if expr_ast.elem_type == Interpreter.NOT_DEF:
-            return self.__eval_unary(expr_ast, Type.BOOL, lambda x: not x)
-
-    def __eval_op(self, arith_ast):
-        left_value_obj = self.__eval_expr(arith_ast.get("op1"))
-        right_value_obj = self.__eval_expr(arith_ast.get("op2"))
-
-        # Handling comparisons involving functions or lambda closures
-        if isinstance(left_value_obj, (LambdaClosure, dict)) or isinstance(right_value_obj, (LambdaClosure, dict)):
-            if arith_ast.elem_type not in ["==", "!="]:
-                super().error(ErrorType.TYPE_ERROR, "Invalid operation on functions or lambdas")
-            # Compare function or lambda references
-            comparison_result = (left_value_obj == right_value_obj)
-            if arith_ast.elem_type == "!=":
-                comparison_result = not comparison_result
-            return Value(Type.BOOL, comparison_result)
-
-        # Check if one operand is int and the other is bool for conversion
-        if (left_value_obj.type() == Type.INT and right_value_obj.type() == Type.BOOL) or (left_value_obj.type() == Type.BOOL and right_value_obj.type() == Type.INT ):
-            # Convert int to bool for logical and comparison operations
-            if arith_ast.elem_type in ["&&", "||", "==", "!="]:
-                left_value_obj = self.__convert_to_bool_if_int(left_value_obj)
-                right_value_obj = self.__convert_to_bool_if_int(right_value_obj)
-        if(left_value_obj.type() == Type.INT and right_value_obj.type() == Type.INT and  arith_ast.elem_type in ["&&", "||",]):
-                left_value_obj = self.__convert_to_bool_if_int(left_value_obj)
-                right_value_obj = self.__convert_to_bool_if_int(right_value_obj)
-        if (left_value_obj.type() == Type.INT and right_value_obj.type() == Type.BOOL) or (left_value_obj.type() == Type.BOOL and right_value_obj.type() == Type.INT or (left_value_obj.type() == Type.BOOL and right_value_obj.type() == Type.BOOL)):
-            # Convert bool to int for arithmetic operations
-            if arith_ast.elem_type in ["+", "-", "*", "/"]:
-                left_value_obj = self.__convert_to_int_if_bool(left_value_obj)
-                right_value_obj = self.__convert_to_int_if_bool(right_value_obj)
-
-        # Perform operation
-        if not self.__compatible_types(arith_ast.elem_type, left_value_obj, right_value_obj):
-            super().error(ErrorType.TYPE_ERROR, f"Incompatible types for {arith_ast.elem_type} operation")
-
-        if arith_ast.elem_type not in self.op_to_lambda[left_value_obj.type()]:
-            super().error(ErrorType.TYPE_ERROR, f"Incompatible operator {arith_ast.elem_type} for type {left_value_obj.type()}")
-
-        f = self.op_to_lambda[left_value_obj.type()][arith_ast.elem_type]
-        return f(left_value_obj, right_value_obj)
-
-    def __compatible_types(self, oper, obj1, obj2):
-        # DOCUMENT: allow comparisons ==/!= of anything against anything
-        if oper in ["==", "!="]:
-            return True
-        return obj1.type() == obj2.type()
-
-    def __eval_unary(self, arith_ast, t, f):
-        value_obj = self.__eval_expr(arith_ast.get("op1"))
-
-        # Check if the operand is a function or lambda
-        if isinstance(value_obj, LambdaClosure) or (isinstance(value_obj, dict) and value_obj.get("type") == "function_ref"):
-            super().error(ErrorType.TYPE_ERROR, "Invalid operation on functions or lambdas")
-
-        # Convert int to bool if necessary
-        if arith_ast.elem_type == Interpreter.NOT_DEF and value_obj.type() == Type.INT:
-            value_obj = self.__convert_to_bool_if_int(value_obj)
-
-        # Perform the unary operation
-        if value_obj.type() != t:
-            super().error(ErrorType.TYPE_ERROR, f"Incompatible type for {arith_ast.elem_type} operation")
-        return Value(t, f(value_obj.value()))
-
-    def __setup_ops(self):
-        self.op_to_lambda = {}
-        # set up operations on integers
-        self.op_to_lambda[Type.INT] = {}
-        self.op_to_lambda[Type.INT]["+"] = lambda x, y: Value(
-            x.type(), x.value() + y.value()
-        )
-        self.op_to_lambda[Type.INT]["-"] = lambda x, y: Value(
-            x.type(), x.value() - y.value()
-        )
-        self.op_to_lambda[Type.INT]["*"] = lambda x, y: Value(
-            x.type(), x.value() * y.value()
-        )
-        self.op_to_lambda[Type.INT]["/"] = lambda x, y: Value(
-            x.type(), x.value() // y.value()
-        )
-        self.op_to_lambda[Type.INT]["=="] = lambda x, y: Value(
-            Type.BOOL, x.type() == y.type() and x.value() == y.value()
-        )
-        self.op_to_lambda[Type.INT]["!="] = lambda x, y: Value(
-            Type.BOOL, x.type() != y.type() or x.value() != y.value()
-        )
-        self.op_to_lambda[Type.INT]["<"] = lambda x, y: Value(
-            Type.BOOL, x.value() < y.value()
-        )
-        self.op_to_lambda[Type.INT]["<="] = lambda x, y: Value(
-            Type.BOOL, x.value() <= y.value()
-        )
-        self.op_to_lambda[Type.INT][">"] = lambda x, y: Value(
-            Type.BOOL, x.value() > y.value()
-        )
-        self.op_to_lambda[Type.INT][">="] = lambda x, y: Value(
-            Type.BOOL, x.value() >= y.value()
-        )
-        #  set up operations on strings
-        self.op_to_lambda[Type.STRING] = {}
-        self.op_to_lambda[Type.STRING]["+"] = lambda x, y: Value(
-            x.type(), x.value() + y.value()
-        )
-        self.op_to_lambda[Type.STRING]["=="] = lambda x, y: Value(
-            Type.BOOL, x.value() == y.value()
-        )
-        self.op_to_lambda[Type.STRING]["!="] = lambda x, y: Value(
-            Type.BOOL, x.value() != y.value()
-        )
-        #  set up operations on bools
-        self.op_to_lambda[Type.BOOL] = {}
-        self.op_to_lambda[Type.BOOL]["&&"] = lambda x, y: Value(
-            x.type(), x.value() and y.value()
-        )
-        self.op_to_lambda[Type.BOOL]["||"] = lambda x, y: Value(
-            x.type(), x.value() or y.value()
-        )
-        self.op_to_lambda[Type.BOOL]["=="] = lambda x, y: Value(
-            Type.BOOL, x.type() == y.type() and x.value() == y.value()
-        )
-        self.op_to_lambda[Type.BOOL]["!="] = lambda x, y: Value(
-            Type.BOOL, x.type() != y.type() or x.value() != y.value()
-        )
-
-        #  set up operations on nil
-        self.op_to_lambda[Type.NIL] = {}
-        self.op_to_lambda[Type.NIL]["=="] = lambda x, y: Value(
-            Type.BOOL, x.type() == y.type() and x.value() == y.value()
-        )
-        self.op_to_lambda[Type.NIL]["!="] = lambda x, y: Value(
-            Type.BOOL, x.type() != y.type() or x.value() != y.value()
-        )
-
-    def __do_if(self, if_ast):
-        cond_ast = if_ast.get("condition")
-        result = self.__eval_expr(cond_ast)
-        if result.type() == Type.INT:
-            coerced_bool = result.value() != 0
-            result = Value(Type.BOOL, coerced_bool)
-        if result.type() != Type.BOOL:
-            super().error(
-                ErrorType.TYPE_ERROR,
-                "Incompatible type for if condition",
-            )
-        if result.value():
-            statements = if_ast.get("statements")
-            status, return_val = self.__run_statements(statements)
-            return (status, return_val)
-        else:
-            else_statements = if_ast.get("else_statements")
-            if else_statements is not None:
-                status, return_val = self.__run_statements(else_statements)
-                return (status, return_val)
-
-        return (ExecStatus.CONTINUE, Interpreter.NIL_VALUE)
-
-
-    def __do_while(self, while_ast):
-        cond_ast = while_ast.get("condition")
-        run_while = Interpreter.TRUE_VALUE
-        while run_while.value():
-            run_while = self.__eval_expr(cond_ast)
-            if run_while.type() == Type.INT:
-                coerced_bool = run_while.value() != 0
-                run_while = Value(Type.BOOL, coerced_bool)
-            if run_while.type() != Type.BOOL:
-                super().error(
-                    ErrorType.TYPE_ERROR,
-                    "Incompatible type for while condition",
-                )
-            if run_while.value():
-                statements = while_ast.get("statements")
-                status, return_val = self.__run_statements(statements)
-                if status == ExecStatus.RETURN:
-                    return status, return_val
-
-        return (ExecStatus.CONTINUE, Interpreter.NIL_VALUE)
-
-    def __do_return(self, return_ast):
-        expr_ast = return_ast.get("expression")
-        if expr_ast is None:
-            return (ExecStatus.RETURN, Interpreter.NIL_VALUE)
+    def handle_while_statement(self, condition_node, statements):
+        condition_value = self.evaluate_expression(condition_node)
         
-        value_obj = self.__eval_expr(expr_ast)
+        if type(condition_value) != bool:
+            self.error(ErrorType.TYPE_ERROR, "Condition in 'while' statement must evaluate to a boolean value.")
+            return
+        
+        while self.evaluate_expression(condition_node):
+            self.variables_stack.append({})  # Start a new scope
+            try:
+                for statement in statements:
+                    self.run_statement(statement)
+            finally:
+                self.variables_stack.pop()
+                
+    def handle_return_statement(self, expression_node):
+        if expression_node is None:
+            raise ReturnException(None)  # Return nil if there is no expression
+        else:
+            value = self.evaluate_expression(expression_node)
+            value_copy = copy.deepcopy(value)
+            raise ReturnException(value_copy)
 
-        # Check if returning a function or a lambda closure
-        if isinstance(value_obj, LambdaClosure) or (isinstance(value_obj, dict) and 'function' in value_obj):
-            # Return a deep copy of the function or lambda closure
-            return (ExecStatus.RETURN, copy.deepcopy(value_obj))
+    def evaluate_expression(self, expr_node):
+        if expr_node.elem_type in ['+', '-', '*', '/']:
+            return self.expression_with_arithmetic(expr_node)
+        elif expr_node.elem_type == 'fcall':
+            return self.handle_function_call(expr_node)
+        elif expr_node.elem_type == 'var':
+            return self.get_variable_value(expr_node.dict['name'])
+        elif expr_node.elem_type in ['int']:
+            return expr_node.dict['val']
+        elif expr_node.elem_type == 'string':
+            return expr_node.dict['val']
+        elif expr_node.elem_type in ['&&', '||']:
+            return self.expression_with_logical(expr_node)
+        elif expr_node.elem_type in ['!','neg']:
+            return self.expression_with_negation(expr_node)
+        elif expr_node.elem_type in ['==', '!=', '<', '<=', '>', '>=']:
+            return self.expression_with_comparison(expr_node)
+        elif expr_node.elem_type == 'bool':
+            return expr_node.dict['val']
+        elif expr_node.elem_type == 'nil':
+            return None
+    def expression_with_logical(self, expression_node):
+        # Evaluate the first operand
+        op1_val = self.evaluate_expression(expression_node.dict['op1'])
+        op2_val = self.evaluate_expression(expression_node.dict['op2'])
+        
+        # Check if both operands are booleans
+        if not isinstance(op1_val, bool) or not isinstance(op2_val, bool):
+            super().error(ErrorType.TYPE_ERROR, "Both operands must be of type bool for logical operations.")
+            return None
 
-        return (ExecStatus.RETURN, value_obj)
-    def __convert_to_bool_if_int(self, value):
-        """Convert an integer value to boolean if necessary."""
-        if isinstance(value, Value) and value.type() == Type.INT:
-            return Value(Type.BOOL, value.value() != 0)
-        return value
-    def __convert_to_int_if_bool(self, value):
-        """Convert a boolean value to an integer."""
-        if isinstance(value, Value) and value.type() == Type.BOOL:
-            return Value(Type.INT, int(value.value()))
-        return value
+        # Perform the logical operations with strict evaluation
+        if expression_node.elem_type == '&&':
+            return op1_val and op2_val
+        elif expression_node.elem_type == '||':
+            return op1_val or op2_val
+        else:
+            super().error(ErrorType.SYNTAX_ERROR, f"Unknown logical operator {expression_node.elem_type}.")
+            return None
+        
+    def expression_with_negation(self, expression_node):
+        op1_val = self.evaluate_expression(expression_node.dict['op1'])
+        
+        # Check for integer negation
+        if expression_node.elem_type == 'neg':
+            if not isinstance(op1_val, int):
+                super().error(ErrorType.TYPE_ERROR, "Operand must be an integer.")
+                return None
+            return -op1_val
+
+        # Check for boolean negation
+        elif expression_node.elem_type == '!':
+            if not isinstance(op1_val, bool):
+                super().error(ErrorType.TYPE_ERROR, "Operand must be of type bool.")
+                return None
+            return not op1_val
+        else:
+            super().error(ErrorType.TYPE_ERROR, f"Unsupported negation operation: {expression_node.elem_type}.")
+            return None
+        
+    def expression_with_comparison(self, expression_node):
+        op1_val = self.evaluate_expression(expression_node.dict['op1'])
+        op2_val = self.evaluate_expression(expression_node.dict['op2'])
+        if(op1_val == None or op1_val =='nil'):
+            op1_val = None
+        if(op2_val == None or op1_val == 'nil'):
+            op2_val = None
+        # == and != checks can compare different types
+        # 'None' is treated as 'nil' and can be compared with any type
+        if op1_val is None and op2_val is None:
+            return True if expression_node.elem_type == '==' else False
+        if (op1_val is None) != (op2_val is None):
+            return False if expression_node.elem_type == '==' else True
+        
+        if expression_node.elem_type == '==':
+            return op1_val == op2_val if type(op1_val) == type(op2_val) else False
+        elif expression_node.elem_type == '!=':
+            return op1_val != op2_val if type(op1_val) == type(op2_val) else True
+
+        # For other comparison operators, ensure neither value is None
+        if op1_val is None or op2_val is None:
+            super().error(ErrorType.TYPE_ERROR, "Cannot compare 'nil' with other types using this operator.")
+            return None
+
+        # Ensure the types of both operands are the same before comparing
+        if type(op1_val) != type(op2_val):
+            super().error(ErrorType.TYPE_ERROR, "Cannot compare values of different types with this operator.")
+            return None
+
+        # Standard comparisons
+        if not isinstance(op1_val, int) or not isinstance(op2_val, int):
+            super().error(ErrorType.TYPE_ERROR, "Both operands must be integers for this type of comparison.")
+            return None
+        
+        if expression_node.elem_type == '<':
+            return op1_val < op2_val
+        elif expression_node.elem_type == '<=':
+            return op1_val <= op2_val
+        elif expression_node.elem_type == '>':
+            return op1_val > op2_val
+        elif expression_node.elem_type == '>=':
+            return op1_val >= op2_val
+
+        # If the comparison operator is not recognized, you can either return None or raise an error
+        super().error(ErrorType.SYNTAX_ERROR, "Unknown comparison operator.")
+        return None
+        
+    def expression_with_arithmetic(self, expression_node):
+        # Evaluating op1
+        def evaluate_operand(operand_node):
+            return self.evaluate_expression(operand_node)  # This change allows for handling of nested expressions
+
+        # Evaluate op1 and op2
+        op1_val = evaluate_operand(expression_node.dict['op1'])
+        op2_val = evaluate_operand(expression_node.dict['op2'])
+
+        if isinstance(op1_val, bool) or isinstance(op2_val, bool) or op1_val is None or op2_val is None:
+            super().error(ErrorType.TYPE_ERROR, "Arithmetic operations are not allowed with bool or nil")
+            return None
+        if type(op1_val) != type(op2_val):
+            super().error(ErrorType.TYPE_ERROR, f"Incompatible types: {type(op1_val).__name__} and {type(op2_val).__name__}")
+            return None 
+        if (expression_node.dict['op1'].elem_type == 'fcall' and expression_node.dict['op1'].dict['name'] == 'inputi') and \
+        (expression_node.dict['op2'].elem_type == 'fcall' and expression_node.dict['op2'].dict['name'] == 'inputi'):
+            super().error(ErrorType.TYPE_ERROR, "Cannot have two inputi function calls in a single arithmetic expression.")
+            return None
+
+        # Perform arithmetic operation
+        if expression_node.elem_type == '+':
+            if isinstance(op1_val, str) or isinstance(op2_val, str):  # Allow string concatenation
+                return str(op1_val) + str(op2_val)
+            return op1_val + op2_val
+        elif expression_node.elem_type == '-':
+            if isinstance(op1_val, str) or isinstance(op2_val, str):
+                super().error(ErrorType.TYPE_ERROR, "Cannot subtract strings.")
+                return None
+            return op1_val - op2_val
+        elif expression_node.elem_type == '*':
+            if isinstance(op1_val, str) or isinstance(op2_val, str):
+                super().error(ErrorType.TYPE_ERROR, "Cannot multiply strings.")
+                return None
+            return op1_val * op2_val
+        elif expression_node.elem_type == '/':
+            if isinstance(op1_val, str) or isinstance(op2_val, str):
+                super().error(ErrorType.TYPE_ERROR, "Cannot divide strings.")
+                return None
+            if op2_val == 0:
+                super().error(ErrorType.VALUE_ERROR, "Division by zero.")
+                return None
+            return op1_val // op2_val
+        
+    def handle_function_call(self, func_node):
+        func_name = func_node.dict['name']
+        args = [self.evaluate_expression(arg) for arg in func_node.dict['args']]
+        args_count = len(args)
+
+        # Check for function overload resolution
+        function_key = (func_name, args_count)
+        
+        # Handling built-in functions
+        if function_key == ('print', len(args)):
+            formatted_args = [(str(arg).lower() if isinstance(arg, bool) else str(arg)) for arg in args]
+            self.output(''.join(formatted_args))
+            return None
+            
+        elif function_key == ('inputi', len(args)):
+            if len(args) > 1:
+                super().error(ErrorType.NAME_ERROR, f"No inputi() function found that takes > 1 parameter")
+                return None
+            if len(args) == 1:
+                prompt = args[0]
+                super().output(prompt)
+
+            user_input = super().get_input()
+            return int(user_input)
+        
+        elif function_key == ('inputs', len(args)):
+            if len(args) > 1:
+                super().error(ErrorType.NAME_ERROR, "inputs() takes at most 1 parameter")
+                return None
+            if len(args) == 1:
+                # Output the prompt before getting input.
+                prompt = args[0]
+                super().output(prompt)
+                
+            # Now, call get_input without any arguments as per its definition.
+            user_input = super().get_input()
+            return str(user_input)
+            
+        # Handling user-defined functions
+        elif function_key in self.functions:
+            # Retrieve the function node from our functions dictionary
+            target_function = self.functions[function_key]
+            
+            
+            # Check if number of arguments matches
+            if len(args) != len(target_function.dict.get('args', [])):
+                super().error(ErrorType.NAME_ERROR, f"Function {func_name} called with incorrect number of arguments")
+                return None
+            
+            # Create a new scope for the function call
+            new_scope = {}
+            
+            # Push the new scope to the stack
+            self.variables_stack.append(new_scope)
+
+            # Now, set the arguments in the new scope after it's been added to the stack
+            for param_node, value in zip(target_function.dict['args'], args):
+                param_name = param_node.dict['name']
+                new_scope[param_name] = value
+            
+            
+
+            # Execute the function
+            try:
+                return_val = self.run_function_node(target_function)
+            finally:
+                # Always remove the function's scope from the stack, even if an exception occurred
+                self.variables_stack.pop()
+                  # Assume you'd also want to pop the args after the call
+            
+            # Return the result
+            return return_val if return_val is not None else "nil"
+            
+        else:
+            super().error(ErrorType.NAME_ERROR, f"Unknown function {func_name}")
+            return None
+        
+    def get_variable_value(self, var_name):
+        # Dynamic scoping: Find the most immediate scope where the variable is defined
+        scope = self.find_variable_scope(var_name)
+        if scope is not None:
+            return scope[var_name]
+        else:
+            super().error(ErrorType.NAME_ERROR, f"Variable {var_name} has not been defined")
+            return None
